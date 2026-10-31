@@ -1,6 +1,6 @@
 import json
 import os
-
+import time
 import pandas as pd
 import streamlit as st
 from google import genai
@@ -71,10 +71,15 @@ def tom_tat(df):
 # ============================================================
 # 2. GỌI MÔ HÌNH AI
 # ============================================================
+MODELS = [MODEL, "gemini-3.7-flash"]  # mô hình chính, rồi mô hình dự phòng
+LOI_PREFIX = "Ôi, Mo-Mo đang bị lỗi kết nối rồi"
+
+
 def hoi_momo(lich_su, df):
     noi_dung = [
         types.Content(role=m["role"], parts=[types.Part(text=m["text"])])
         for m in lich_su
+        if not m["text"].startswith(LOI_PREFIX)
     ]
     cfg = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT + "\n\n" + tom_tat(df),
@@ -82,13 +87,17 @@ def hoi_momo(lich_su, df):
         max_output_tokens=1000,
         thinking_config=types.ThinkingConfig(thinking_level="LOW"),
     )
-    try:
-        return client.models.generate_content(
-            model=MODEL, contents=noi_dung, config=cfg
-        ).text
-    except Exception as e:
-        return f"Ôi, Mo-Mo đang bị lỗi kết nối rồi 😵 Cậu thử lại sau nhé. (Chi tiết: {e})"
-
+    loi_cuoi = None
+    for ten_model in MODELS:
+        for lan in range(3):
+            try:
+                return client.models.generate_content(
+                    model=ten_model, contents=noi_dung, config=cfg
+                ).text
+            except Exception as e:
+                loi_cuoi = e
+                time.sleep(2 * (lan + 1))
+    return f"{LOI_PREFIX} 😵 Cậu thử lại sau ít phút nhé. (Chi tiết: {loi_cuoi})"
 
 # ============================================================
 # 3. LƯU / TẢI LỊCH SỬ HỘI THOẠI
