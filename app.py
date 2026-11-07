@@ -1,6 +1,11 @@
+import hashlib
 import json
 import os
+import re
+import shutil
 import time
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 import streamlit as st
 from google import genai
@@ -11,10 +16,17 @@ from google.genai import types
 # ============================================================
 st.set_page_config(page_title="MoMo - Trợ lý Mo-Mo", page_icon="💖", layout="centered")
 
-MODEL = "gemini-3.8-flash"  # Kiểm tra tên mô hình hiện hành trong Google AI Studio
+MODEL = "gemini-3.8-flash"  # Đổi nếu mô hình không còn dùng được
 FILE_DATA = "giao_dich_genz.csv"
+FILE_DATA_GOC = "giao_dich_goc.csv"  # (không bắt buộc) bản sao dữ liệu mẫu
 FILE_CHAT = "lich_su_chat.json"
+FILE_TRANG_THAI = "trang_thai_ai.json"
 HAN_MUC = {"Ăn uống": 1_500_000, "Mua sắm": 1_000_000, "Đu idol": 1_500_000}
+
+# --- Giới hạn để tiết kiệm lượt gọi AI ---
+LUOT_TOI_DA = 15  # Gói miễn phí hiện chỉ cho 20 lượt/ngày -> chừa dự phòng
+MAX_LICH_SU = 6  # Chỉ gửi tối đa 6 tin gần nhất cho AI
+PREFIX = "Ôi, Mo-Mo"  # Mọi tin báo lỗi/nghỉ đều bắt đầu bằng cụm này
 
 SYSTEM_PROMPT = """
 Bạn là Mo-Mo, trợ lý quản lý chi tiêu trong ứng dụng ví MoMo, nói chuyện với người dùng GenZ.
@@ -35,14 +47,17 @@ GIỚI HẠN (GUARDRAILS):
 - Không trả lời câu hỏi ngoài chủ đề tài chính cá nhân; lịch sự đưa người dùng quay lại chủ đề.
 """
 
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+client = genai.Client(
+    api_key=st.secrets["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(timeout=30000),
+)
 
 
 # ============================================================
 # 1. ĐỌC VÀ TỔNG HỢP DỮ LIỆU
 # ============================================================
 def doc_du_lieu():
-    return pd.read_csv(FILE_DATA, parse_dates=["ngay"])
+    return pd.read_csv(FILE_DATA, parse_dates=["ngay"], encoding="utf-8-sig")
 
 
 def tom_tat(df):
@@ -50,7 +65,6 @@ def tom_tat(df):
     chi = df[df.loai == "chi"]
     tong_chi = chi.so_tien.sum()
     theo_nhom = chi.groupby("danh_muc").so_tien.sum().sort_values(ascending=False)
-
     dong = [
         f"- {k}: {v:,.0f}đ ({v / tong_chi:.0%} tổng chi)" for k, v in theo_nhom.items()
     ]
@@ -68,44 +82,208 @@ def tom_tat(df):
     )
 
 
-# ============================================================
-# 2. GỌI MÔ HÌNH AI
-# ============================================================
-MODELS = [MODEL, "gemini-3.7-flash"]  # mô hình chính, rồi mô hình dự phòng
-LOI_PREFIX = "Ôi, Mo-Mo đang bị lỗi kết nối rồi"
+def nhan_xet_nhanh(df, nhom, tien):
+    """Nhận xét tức thì bằng Python, KHÔNG tốn lượt gọi AI."""
+    chi = df[df.loai == "chi"]
+    tong_nhom = chi[chi.danh_muc == nhom].so_tien.sum()
+    dong = f"✅ Đã ghi {tien:,.0f}đ vào nhóm {nhom}. Nhóm này đã chi {tong_nhom:,.0f}đ"
+    han = HAN_MUC.get(nhom)
+    if han:
+        if tong_nhom > han:
+            dong += f", vượt hạn mức {tong_nhom - han:,.0f}đ ⚠️"
+        else:
+            dong += f", còn {han - tong_nhom:,.0f}đ so với hạn mức."
+    return dong
 
 
-def hoi_momo(lich_su, df):
+# ============================================================
+# 2. QUẢN LÝ LƯỢT GỌI AI (đếm lượt, khóa tạm khi lỗi, bộ nhớ đệm)
+# ============================================================
+def hom_nay():
+    # Quota của Google tính theo ngày giờ Thái Bình Dương (xấp xỉ UTC-8)
+    return datetime.now(timezone(timedelta(hours=-8))).strftime("%Y-%m-%d")
+
+
+def doc_trang_thai():
+    tt = {"ngay": hom_nay(), "da_dung": 0, "khoa_den": 0.0}
+    if os.path.exists(FILE_TRANG_THAI):
+        try:
+            with open(FILE_TRANG_THAI, encoding="utf-8") as f:
+                du = json.load(f)
+            if du.get("ngay") == tt["ngay"]:
+                tt["da_dung"] = int(du.get("da_dung", 0))
+            tt["khoa_den"] = float(du.get("khoa_den", 0.0))
+        except Exception:
+            pass
+    return tt
+
+
+def luu_trang_thai(tt):
+    try:
+        with open(FILE_TRANG_THAI, "w", encoding="utf-8") as f:
+            json.dump(tt, f)
+    except Exception:
+        pass
+
+
+def khoa_con_lai(tt=None):
+    tt = tt or doc_trang_thai()
+    return max(0.0, tt["khoa_den"] - time.time())
+
+
+def dinh_dang_thoi_gian(giay):
+    giay = int(giay)
+    if giay >= 3600:
+        return f"{giay // 3600} giờ {(giay % 3600) // 60} phút"
+    if giay >= 60:
+        return f"{giay // 60} phút"
+    return f"{max(giay, 1)} giây"
+
+
+def kiem_tra_cho_phep():
+    """Kiểm tra TRƯỚC khi gọi API. Nếu không được phép thì không gửi yêu cầu nào."""
+    tt = doc_trang_thai()
+    con = khoa_con_lai(tt)
+    if con > 0:
+        return False, (
+            f"{PREFIX} đang nghỉ ngơi 😴 "
+            f"Cậu quay lại sau khoảng {dinh_dang_thoi_gian(con)} nhé."
+        )
+    if tt["da_dung"] >= LUOT_TOI_DA:
+        return False, f"{PREFIX} đã dùng hết {LUOT_TOI_DA} lượt hỏi hôm nay 😴 Mai cậu quay lại nhé!"
+    return True, ""
+
+
+def ghi_nhan_luot():
+    tt = doc_trang_thai()
+    tt["da_dung"] += 1
+    luu_trang_thai(tt)
+
+
+def dat_khoa(giay):
+    tt = doc_trang_thai()
+    tt["khoa_den"] = time.time() + giay
+    luu_trang_thai(tt)
+
+
+def doc_thoi_gian_cho(loi):
+    """Lấy số giây Google yêu cầu chờ từ thông báo lỗi 429."""
+    m = re.search(r"retryDelay\W+(\d+(?:\.\d+)?)s", loi)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"retry in\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?", loi)
+    if m and any(m.groups()):
+        h, mi, s = (float(x) if x else 0.0 for x in m.groups())
+        return h * 3600 + mi * 60 + s
+    return None
+
+
+def xu_ly_loi(e):
+    """Đổi lỗi thành câu thân thiện và khóa tạm để không gửi lại liên tục."""
+    loi = str(e)
+    print("LỖI GỌI AI:", loi[:500])  # xem chi tiết trong Terminal / Manage app
+    if "429" in loi or "RESOURCE_EXHAUSTED" in loi:
+        cho = doc_thoi_gian_cho(loi)
+        if cho is None:
+            cho = 6 * 3600 if ("PerDay" in loi or "per day" in loi) else 65
+        dat_khoa(cho + 5)
+        return f"{PREFIX} hết lượt hỏi miễn phí rồi 😴 Cậu quay lại sau khoảng {dinh_dang_thoi_gian(cho)} nhé."
+    if "503" in loi or "UNAVAILABLE" in loi or "INTERNAL" in loi or "DEADLINE" in loi or "timed out" in loi.lower():
+        dat_khoa(20)
+        return f"{PREFIX} đang quá tải 😵 Cậu đợi khoảng 20 giây rồi hỏi lại nhé."
+    if "404" in loi or "NOT_FOUND" in loi:
+        dat_khoa(60)
+        return f"{PREFIX} không tìm thấy mô hình AI 😵 Cần kiểm tra lại tên mô hình (biến MODEL) trong app.py."
+    dat_khoa(10)
+    return f"{PREFIX} đang bị lỗi kết nối 😵 Cậu thử lại sau ít phút nhé."
+
+
+@st.cache_resource
+def bo_nho_dem():
+    return {}
+
+
+def chuan_bi_lich_su(lich_su):
+    """Bỏ tin báo lỗi, chỉ lấy tin gần nhất, gộp các tin liên tiếp cùng vai."""
+    sach = [m for m in lich_su if not m["text"].startswith(PREFIX)]
+    sach = sach[-MAX_LICH_SU:]
+    while sach and sach[0]["role"] != "user":
+        sach.pop(0)
+    gop = []
+    for m in sach:
+        if gop and gop[-1]["role"] == m["role"]:
+            gop[-1] = {"role": m["role"], "text": gop[-1]["text"] + "\n" + m["text"]}
+        else:
+            gop.append(dict(m))
+    return gop
+
+
+# ============================================================
+# 3. GỌI MÔ HÌNH AI (mỗi câu hỏi tối đa 1 lượt, không tự thử lại)
+# ============================================================
+def hoi_momo_stream(lich_su, df, max_tokens=500):
+    gui = chuan_bi_lich_su(lich_su)
+    if not gui:
+        yield f"{PREFIX} chưa nhận được câu hỏi nào 🤔"
+        return
+
+    tom_tat_du_lieu = tom_tat(df)
+    khoa = hashlib.md5(
+        (tom_tat_du_lieu + "||" + "||".join(m["text"] for m in gui[-3:])).encode("utf-8")
+    ).hexdigest()
+
+    # (a) Câu hỏi đã trả lời với cùng dữ liệu -> dùng lại, KHÔNG tốn lượt
+    da_co = bo_nho_dem().get(khoa)
+    if da_co:
+        yield da_co
+        return
+
+    # (b) Đang bị khóa hoặc hết lượt trong ngày -> không gửi yêu cầu nào
+    ok, thong_bao = kiem_tra_cho_phep()
+    if not ok:
+        yield thong_bao
+        return
+
+    # (c) Gọi API đúng 1 lần
+    ghi_nhan_luot()
     noi_dung = [
-        types.Content(role=m["role"], parts=[types.Part(text=m["text"])])
-        for m in lich_su
-        if not m["text"].startswith(LOI_PREFIX)
+        types.Content(role=m["role"], parts=[types.Part(text=m["text"])]) for m in gui
     ]
     cfg = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT + "\n\n" + tom_tat(df),
+        system_instruction=SYSTEM_PROMPT + "\n\n" + tom_tat_du_lieu,
         temperature=0.8,
-        max_output_tokens=1000,
+        max_output_tokens=max_tokens,
         thinking_config=types.ThinkingConfig(thinking_level="LOW"),
     )
-    loi_cuoi = None
-    for ten_model in MODELS:
-        for lan in range(3):
-            try:
-                return client.models.generate_content(
-                    model=ten_model, contents=noi_dung, config=cfg
-                ).text
-            except Exception as e:
-                loi_cuoi = e
-                time.sleep(2 * (lan + 1))
-    return f"{LOI_PREFIX} 😵 Cậu thử lại sau ít phút nhé. (Chi tiết: {loi_cuoi})"
+    cac_doan = []
+    try:
+        for chunk in client.models.generate_content_stream(
+            model=MODEL, contents=noi_dung, config=cfg
+        ):
+            if chunk.text:
+                cac_doan.append(chunk.text)
+                yield chunk.text
+    except Exception as e:
+        thong_bao_loi = xu_ly_loi(e)
+        if not cac_doan:  # đã có chữ rồi thì giữ nguyên, chỉ khóa tạm
+            yield thong_bao_loi
+        return
+
+    day_du = "".join(cac_doan).strip()
+    if day_du:
+        bo_nho_dem()[khoa] = day_du
+
 
 # ============================================================
-# 3. LƯU / TẢI LỊCH SỬ HỘI THOẠI
+# 4. LƯU / TẢI LỊCH SỬ HỘI THOẠI
 # ============================================================
 def tai_lich_su():
     if os.path.exists(FILE_CHAT):
-        with open(FILE_CHAT, encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(FILE_CHAT, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
     return []
 
 
@@ -114,14 +292,15 @@ def luu_lich_su(ls):
         json.dump(ls, f, ensure_ascii=False, indent=2)
 
 
+# ===== GIAO DIỆN =====
 if "lich_su" not in st.session_state:
     st.session_state.lich_su = tai_lich_su()
 
-# ============================================================
-# 4. THANH BÊN: THÊM GIAO DỊCH + XÓA LỊCH SỬ
-# ============================================================
 df = doc_du_lieu()
 
+# ============================================================
+# 5. THANH BÊN
+# ============================================================
 with st.sidebar.form("giao_dich_moi"):
     st.subheader("➕ Thêm giao dịch")
     mo_ta = st.text_input("Mô tả", "Trà sữa full topping")
@@ -141,13 +320,15 @@ if gui:
             }
         ]
     )
-    moi.to_csv(FILE_DATA, mode="a", header=False, index=False)
+    moi.to_csv(FILE_DATA, mode="a", header=False, index=False, encoding="utf-8")
     df = doc_du_lieu()
-    yeu_cau = f"Tớ vừa chi {tien:,.0f}đ cho '{mo_ta}' (nhóm {nhom}). Nhận xét nhanh giúp tớ."
-    st.session_state.lich_su.append({"role": "user", "text": yeu_cau})
-    with st.spinner("Mo-Mo đang soi giao dịch..."):
-        tra_loi = hoi_momo(st.session_state.lich_su, df)
-    st.session_state.lich_su.append({"role": "model", "text": tra_loi})
+    # Nhận xét bằng Python: tức thì và không tốn lượt AI
+    st.session_state.lich_su.append(
+        {"role": "user", "text": f"Tớ vừa ghi {tien:,.0f}đ cho '{mo_ta}' ({nhom})."}
+    )
+    st.session_state.lich_su.append(
+        {"role": "model", "text": nhan_xet_nhanh(df, nhom, tien)}
+    )
     luu_lich_su(st.session_state.lich_su)
     st.rerun()
 
@@ -156,8 +337,24 @@ if st.sidebar.button("🗑️ Xóa lịch sử chat"):
     luu_lich_su([])
     st.rerun()
 
+if os.path.exists(FILE_DATA_GOC) and st.sidebar.button("🔄 Đặt lại dữ liệu mẫu"):
+    shutil.copy(FILE_DATA_GOC, FILE_DATA)
+    st.session_state.lich_su = []
+    luu_lich_su([])
+    st.rerun()
+
+tt = doc_trang_thai()
+con_khoa = khoa_con_lai(tt)
+het_luot = tt["da_dung"] >= LUOT_TOI_DA
+ai_nghi = con_khoa > 0 or het_luot
+st.sidebar.caption(f"Lượt hỏi AI hôm nay: {tt['da_dung']}/{LUOT_TOI_DA}")
+if con_khoa > 0:
+    st.sidebar.warning(f"AI tạm nghỉ, thử lại sau khoảng {dinh_dang_thoi_gian(con_khoa)}.")
+elif het_luot:
+    st.sidebar.warning("Đã hết lượt hỏi AI hôm nay.")
+
 # ============================================================
-# 5. GIAO DIỆN MÔ PHỎNG APP MOMO
+# 6. GIAO DIỆN MÔ PHỎNG APP MOMO
 # ============================================================
 st.markdown(
     """
@@ -183,19 +380,22 @@ st.caption("Chi tiêu theo nhóm")
 st.bar_chart(df[df.loai == "chi"].groupby("danh_muc").so_tien.sum())
 
 # ============================================================
-# 6. KHUNG CHAT
+# 7. KHUNG CHAT
 # ============================================================
 for m in st.session_state.lich_su:
     with st.chat_message("assistant" if m["role"] == "model" else "user"):
         st.write(m["text"])
 
-if cau_hoi := st.chat_input("Hỏi Mo-Mo về chi tiêu của cậu..."):
+cau_hoi = st.chat_input(
+    "Mo-Mo đang nghỉ, quay lại sau nhé..." if ai_nghi else "Hỏi Mo-Mo về chi tiêu của cậu...",
+    disabled=ai_nghi,
+)
+if cau_hoi:
     st.session_state.lich_su.append({"role": "user", "text": cau_hoi})
     with st.chat_message("user"):
         st.write(cau_hoi)
     with st.chat_message("assistant"):
-        with st.spinner("Mo-Mo đang soi ví cậu..."):
-            tra_loi = hoi_momo(st.session_state.lich_su, df)
-        st.write(tra_loi)
+        tra_loi = st.write_stream(hoi_momo_stream(st.session_state.lich_su, df))
     st.session_state.lich_su.append({"role": "model", "text": tra_loi})
     luu_lich_su(st.session_state.lich_su)
+    st.rerun()  # cập nhật bộ đếm lượt ở thanh bên
