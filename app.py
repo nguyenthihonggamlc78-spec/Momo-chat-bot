@@ -16,7 +16,7 @@ from google.genai import types
 # ============================================================
 st.set_page_config(page_title="MoMo - Trợ lý Mo-Mo", page_icon="💖", layout="centered")
 
-MODEL = "gemini-3.8-flash"  # Đổi nếu mô hình không còn dùng được
+MODEL = "gemini-3.6-flash"  # Đổi nếu mô hình không còn dùng được
 FILE_DATA = "giao_dich_genz.csv"
 FILE_DATA_GOC = "giao_dich_goc.csv"  # (không bắt buộc) bản sao dữ liệu mẫu
 FILE_CHAT = "lich_su_chat.json"
@@ -34,7 +34,9 @@ Bạn là Mo-Mo, trợ lý quản lý chi tiêu trong ứng dụng ví MoMo, nó
 
 TÍNH CÁCH:
 - Xưng "tớ", gọi người dùng là "cậu". Giọng bạn thân, hài hước, hơi mỏ hỗn, có thể trêu nhẹ.
-- Dùng 1-2 emoji mỗi câu trả lời, câu trả lời ngắn gọn (tối đa 5 câu).
+- Dùng 1-2 emoji. Trả lời 3-5 câu, đủ ý theo thứ tự: (1) nêu số liệu cụ thể liên quan đến câu hỏi,
+  (2) nhận xét hài hước, (3) gợi ý hành động.
+- Luôn viết số tiền đầy đủ, ví dụ 2.250.000đ (không viết tắt, không bỏ chữ số).
 
 QUY TẮC:
 - CHỈ dùng số liệu trong phần [DỮ LIỆU] bên dưới. Tuyệt đối không tự bịa số.
@@ -237,7 +239,7 @@ def chuan_bi_lich_su(lich_su):
 # ============================================================
 # 3. GỌI MÔ HÌNH AI (mỗi câu hỏi tối đa 1 lượt, không tự thử lại)
 # ============================================================
-def hoi_momo_stream(lich_su, df, max_tokens=500):
+def hoi_momo_stream(lich_su, df, max_tokens=1500):
     gui = chuan_bi_lich_su(lich_su)
     if not gui:
         yield f"{PREFIX} chưa nhận được câu hỏi nào 🤔"
@@ -272,10 +274,16 @@ def hoi_momo_stream(lich_su, df, max_tokens=500):
         thinking_config=types.ThinkingConfig(thinking_level="LOW"),
     )
     cac_doan = []
+    ly_do = ""
     try:
         for chunk in client.models.generate_content_stream(
             model=MODEL, contents=noi_dung, config=cfg
         ):
+            try:
+                if chunk.candidates[0].finish_reason:
+                    ly_do = str(chunk.candidates[0].finish_reason)
+            except Exception:
+                pass
             if chunk.text:
                 cac_doan.append(chunk.text)
                 yield chunk.text
@@ -286,8 +294,13 @@ def hoi_momo_stream(lich_su, df, max_tokens=500):
         return
 
     day_du = "".join(cac_doan).strip()
-    if day_du:
-        bo_nho_dem()[khoa] = day_du
+    if not day_du:
+        yield f"{PREFIX} nghĩ mãi mà chưa ra câu trả lời 🤔 Cậu hỏi lại giúp tớ nhé."
+        return
+    if "MAX_TOKENS" in ly_do:  # câu bị cụt: báo cho người dùng, không lưu cache
+        yield " …(tớ nói chưa hết, cậu hỏi tiếp để tớ nói thêm nhé)"
+        return
+    bo_nho_dem()[khoa] = day_du
 
 
 # ============================================================
