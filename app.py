@@ -27,6 +27,7 @@ HAN_MUC = {"Ăn uống": 1_500_000, "Mua sắm": 1_000_000, "Đu idol": 1_500_00
 LUOT_TOI_DA = 15  # Gói miễn phí hiện chỉ cho 20 lượt/ngày -> chừa dự phòng
 MAX_LICH_SU = 6  # Chỉ gửi tối đa 6 tin gần nhất cho AI
 PREFIX = "Ôi, Mo-Mo"  # Mọi tin báo lỗi/nghỉ đều bắt đầu bằng cụm này
+DEBUG = True  # True: hiện chi tiết lỗi thật trong khung chat. Đổi False khi demo/nộp bài
 
 SYSTEM_PROMPT = """
 Bạn là Mo-Mo, trợ lý quản lý chi tiêu trong ứng dụng ví MoMo, nói chuyện với người dùng GenZ.
@@ -49,7 +50,7 @@ GIỚI HẠN (GUARDRAILS):
 
 client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"],
-    http_options=types.HttpOptions(timeout=30000),
+    http_options=types.HttpOptions(timeout=90000),
 )
 
 
@@ -181,21 +182,29 @@ def doc_thoi_gian_cho(loi):
 def xu_ly_loi(e):
     """Đổi lỗi thành câu thân thiện và khóa tạm để không gửi lại liên tục."""
     loi = str(e)
-    print("LỖI GỌI AI:", loi[:500])  # xem chi tiết trong Terminal / Manage app
+    print("LỖI GỌI AI:", loi[:800])  # xem đầy đủ trong Terminal / Manage app > Logs
+    chi_tiet = f" [Chi tiết: {loi[:160]}]" if DEBUG else ""
+    thap = loi.lower()
     if "429" in loi or "RESOURCE_EXHAUSTED" in loi:
         cho = doc_thoi_gian_cho(loi)
         if cho is None:
             cho = 6 * 3600 if ("PerDay" in loi or "per day" in loi) else 65
         dat_khoa(cho + 5)
         return f"{PREFIX} hết lượt hỏi miễn phí rồi 😴 Cậu quay lại sau khoảng {dinh_dang_thoi_gian(cho)} nhé."
-    if "503" in loi or "UNAVAILABLE" in loi or "INTERNAL" in loi or "DEADLINE" in loi or "timed out" in loi.lower():
+    if "timed out" in thap or "timeout" in thap or "DEADLINE" in loi:
+        dat_khoa(10)
+        return f"{PREFIX} chờ AI trả lời quá lâu ⏳ Cậu thử lại nhé.{chi_tiet}"
+    if "503" in loi or "UNAVAILABLE" in loi or ("500" in loi and "INTERNAL" in loi):
         dat_khoa(20)
-        return f"{PREFIX} đang quá tải 😵 Cậu đợi khoảng 20 giây rồi hỏi lại nhé."
+        return f"{PREFIX} đang quá tải 😵 Cậu đợi khoảng 20 giây rồi hỏi lại nhé.{chi_tiet}"
     if "404" in loi or "NOT_FOUND" in loi:
         dat_khoa(60)
-        return f"{PREFIX} không tìm thấy mô hình AI 😵 Cần kiểm tra lại tên mô hình (biến MODEL) trong app.py."
+        return f"{PREFIX} không tìm thấy mô hình AI 😵 Cần kiểm tra lại tên mô hình (biến MODEL).{chi_tiet}"
+    if "400" in loi or "INVALID_ARGUMENT" in loi:
+        dat_khoa(10)
+        return f"{PREFIX} gửi yêu cầu chưa đúng định dạng 😵 Cần kiểm tra lại cấu hình gọi AI.{chi_tiet}"
     dat_khoa(10)
-    return f"{PREFIX} đang bị lỗi kết nối 😵 Cậu thử lại sau ít phút nhé."
+    return f"{PREFIX} đang bị lỗi kết nối 😵 Cậu thử lại sau ít phút nhé.{chi_tiet}"
 
 
 @st.cache_resource
@@ -204,8 +213,15 @@ def bo_nho_dem():
 
 
 def chuan_bi_lich_su(lich_su):
-    """Bỏ tin báo lỗi, chỉ lấy tin gần nhất, gộp các tin liên tiếp cùng vai."""
-    sach = [m for m in lich_su if not m["text"].startswith(PREFIX)]
+    """Bỏ tin báo lỗi và các câu hỏi đã thất bại, chỉ lấy tin gần nhất."""
+    sach = []
+    for i, m in enumerate(lich_su):
+        if m["text"].startswith(PREFIX):
+            continue
+        sau = lich_su[i + 1] if i + 1 < len(lich_su) else None
+        if m["role"] == "user" and sau and sau["text"].startswith(PREFIX):
+            continue  # câu hỏi này đã thất bại, không gửi lại cho AI
+        sach.append(m)
     sach = sach[-MAX_LICH_SU:]
     while sach and sach[0]["role"] != "user":
         sach.pop(0)
